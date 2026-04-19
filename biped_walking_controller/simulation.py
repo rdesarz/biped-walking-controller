@@ -220,6 +220,44 @@ def _apply_velocity_to_pybullet(robot_id, v_des, pb_to_pin_joint_vel):
         )
 
 
+def _disable_pybullet_joint_motors(robot_id, pb_to_pin_joint_vel):
+    """
+    Disable Bullet's built-in motors before using explicit torque control.
+
+    Args:
+        robot_id (int): PyBullet body id.
+        pb_to_pin_joint_vel (Dict[int,int]): Bullet joint id -> Pinocchio velocity index map.
+    """
+    for j_id in pb_to_pin_joint_vel:
+        pb.setJointMotorControl2(robot_id, j_id, pb.VELOCITY_CONTROL, force=0.0)
+
+
+def _apply_torque_to_pybullet(robot_id, tau, pb_to_pin_joint_vel):
+    """
+    Apply actuator torques to Bullet joints using Pinocchio/TSID ordering.
+
+    Args:
+        robot_id (int): PyBullet body id.
+        tau (np.ndarray): Actuated joint torques, ordered like Pinocchio velocities after free-flyer.
+        pb_to_pin_joint_vel (Dict[int,int]): Bullet joint id -> Pinocchio velocity index map.
+
+    Notes:
+        TSID returns only actuated torques, while Pinocchio velocity indices include
+        the 6D floating base first. The torque index is therefore ``idx_v - 6``.
+    """
+    for j_id, v_id in pb_to_pin_joint_vel.items():
+        tau_id = v_id - 6
+        if tau_id < 0 or tau_id >= len(tau):
+            continue
+
+        torque = float(tau[tau_id])
+        joint_max = pb.getJointInfo(robot_id, j_id)[10]
+        if joint_max > 0.0:
+            torque = float(np.clip(torque, -joint_max, joint_max))
+
+        pb.setJointMotorControl2(robot_id, j_id, pb.TORQUE_CONTROL, force=torque)
+
+
 def _reset_pybullet_position(robot_id, q_des, j_to_q_idx):
     """
     Hard reset of Bullet joint positions.
@@ -271,6 +309,44 @@ def _get_q_from_pybullet(robot_id, nq, map_joint_idx_to_q_idx):
             continue
         q[q_id] = pb.getJointState(robot_id, j_id)[0]
     return q
+
+
+def _get_v_from_pybullet(robot_id, nv, pb_to_pin_joint_vel):
+    """
+    Read a Pinocchio-style generalized velocity vector from PyBullet.
+
+    Args:
+        robot_id (int): PyBullet body id.
+        nv (int): size of the generalized velocity vector.
+        pb_to_pin_joint_vel (Dict[int,int]): Bullet joint id -> Pinocchio velocity index map.
+
+    Returns:
+        np.ndarray: generalized velocity with the free-flyer first, then joints.
+    """
+    v = np.zeros(nv)
+
+    com_pos, com_quat = pb.getBasePositionAndOrientation(robot_id)
+    lin_com_world, ang_world = pb.getBaseVelocity(robot_id)
+
+    # Convert Bullet's inertial/CoM base velocity to the base_link velocity.
+    _, _, _, p_li, q_li, *_ = pb.getDynamicsInfo(robot_id, -1)
+    p_ib, q_ib = pb.invertTransform(p_li, q_li)
+    _, q_base = pb.multiplyTransforms(com_pos, com_quat, p_ib, q_ib)
+
+    base_rot = np.array(pb.getMatrixFromQuaternion(q_base)).reshape(3, 3)
+    com_offset_world = base_rot @ np.array(p_li)
+    lin_base_world = np.array(lin_com_world) - np.cross(np.array(ang_world), com_offset_world)
+
+    # Pinocchio free-flyer velocities are expressed in the local base frame.
+    v[:3] = base_rot.T @ lin_base_world
+    v[3:6] = base_rot.T @ np.array(ang_world)
+
+    for j_id, v_id in pb_to_pin_joint_vel.items():
+        if v_id < 0:
+            continue
+        v[v_id] = pb.getJointState(robot_id, j_id)[1]
+
+    return v
 
 
 def _build_pb_to_pin_joints_map(robot_id, model):
@@ -526,6 +602,25 @@ class Simulator:
             robot_id=self.robot_id, v_des=v, pb_to_pin_joint_vel=self.pb_to_pin_joint_vel
         )
 
+    def disable_joint_motors(self):
+        """
+        Disable PyBullet's default joint motors before explicit torque control.
+        """
+        _disable_pybullet_joint_motors(self.robot_id, self.pb_to_pin_joint_vel)
+
+    def apply_joint_torques(self, tau: np.ndarray):
+        """
+        Send joint torques to PyBullet in TSID/Pinocchio actuator ordering.
+
+        Parameters
+        ----------
+        tau : np.ndarray, shape (nv - 6,)
+            Actuated joint torques returned by TSID.
+        """
+        _apply_torque_to_pybullet(
+            robot_id=self.robot_id, tau=tau, pb_to_pin_joint_vel=self.pb_to_pin_joint_vel
+        )
+
     def get_q(self, nq: int) -> np.ndarray:
         """
         Read the current configuration vector from PyBullet.
@@ -538,9 +633,25 @@ class Simulator:
         Returns
         -------
         np.ndarray, shape (nq,)
-            Configuration with base pose first (x,y,z, qw,qx,qy,qz), then joints.
+            Configuration with base pose first (x,y,z, qx,qy,qz,qw), then joints.
         """
         return _get_q_from_pybullet(self.robot_id, nq, self.pb_to_pin_joints_pos)
+
+    def get_v(self, nv: int) -> np.ndarray:
+        """
+        Read the current generalized velocity vector from PyBullet.
+
+        Parameters
+        ----------
+        nv : int
+            Total velocity size expected by Pinocchio.
+
+        Returns
+        -------
+        np.ndarray, shape (nv,)
+            Floating-base and joint velocities in Pinocchio ordering.
+        """
+        return _get_v_from_pybullet(self.robot_id, nv, self.pb_to_pin_joint_vel)
 
     def update_camera_to_follow_pos(self, x: float, y: float, z: float):
         """

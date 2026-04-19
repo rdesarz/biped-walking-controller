@@ -11,6 +11,7 @@ import argparse
 import math
 from dataclasses import dataclass
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pinocchio as pin
@@ -33,6 +34,130 @@ class GeneralParams:
     n_solver_iter: int = 1000
 
 
+def _parse_xyz(text: str | None) -> np.ndarray:
+    if text is None:
+        return np.zeros(3)
+    return np.array([float(v) for v in text.split()], dtype=float)
+
+
+def _rpy_to_matrix(rpy: np.ndarray) -> np.ndarray:
+    roll, pitch, yaw = rpy
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+
+    rot_x = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    rot_y = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+    rot_z = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+
+    return rot_z @ rot_y @ rot_x
+
+
+def _origin_to_transform(origin: ET.Element | None) -> np.ndarray:
+    transform = np.eye(4)
+    if origin is None:
+        return transform
+
+    xyz = _parse_xyz(origin.attrib.get("xyz"))
+    rpy = _parse_xyz(origin.attrib.get("rpy"))
+    transform[:3, :3] = _rpy_to_matrix(rpy)
+    transform[:3, 3] = xyz
+    return transform
+
+
+def _find_link(root: ET.Element, link_name: str) -> ET.Element:
+    for link in root.findall("link"):
+        if link.attrib.get("name") == link_name:
+            return link
+    raise ValueError(f"Link '{link_name}' not found in URDF")
+
+
+def _find_parent_link_and_transform(root: ET.Element, child_link_name: str):
+    for joint in root.findall("joint"):
+        child = joint.find("child")
+        if child is None or child.attrib.get("link") != child_link_name:
+            continue
+
+        parent = joint.find("parent")
+        if parent is None:
+            break
+
+        return parent.attrib["link"], _origin_to_transform(joint.find("origin"))
+
+    return child_link_name, np.eye(4)
+
+
+def contact_points_from_urdf_box(urdf_path: Path, contact_frame_name: str) -> np.ndarray:
+    """
+    Read the rectangular foot contact patch from a URDF collision box.
+
+    Talos stores the foot collision box on ``leg_*_6_link`` and attaches the
+    ``*_sole_link`` contact frame with a fixed joint. This function transforms
+    that box into the sole frame and returns its XY footprint at z=0.
+    """
+    root = ET.parse(urdf_path).getroot()
+    collision_link_name, parent_to_contact = _find_parent_link_and_transform(
+        root, contact_frame_name
+    )
+    collision_link = _find_link(root, collision_link_name)
+    contact_to_parent = np.linalg.inv(parent_to_contact)
+
+    best_points = None
+    best_area = -np.inf
+
+    for collision in collision_link.findall("collision"):
+        box = collision.find("geometry/box")
+        if box is None:
+            continue
+
+        size = _parse_xyz(box.attrib["size"])
+        half_size = 0.5 * size
+        parent_to_box = _origin_to_transform(collision.find("origin"))
+
+        local_corners = np.array(
+            [
+                [sx * half_size[0], sy * half_size[1], sz * half_size[2], 1.0]
+                for sx in (-1.0, 1.0)
+                for sy in (-1.0, 1.0)
+                for sz in (-1.0, 1.0)
+            ]
+        ).T
+        contact_corners = (contact_to_parent @ parent_to_box @ local_corners)[:3].T
+
+        min_xy = contact_corners[:, :2].min(axis=0)
+        max_xy = contact_corners[:, :2].max(axis=0)
+        area = np.prod(max_xy - min_xy)
+        if area <= best_area:
+            continue
+
+        best_area = area
+        best_points = np.array(
+            [
+                [max_xy[0], max_xy[1], 0.0],
+                [max_xy[0], min_xy[1], 0.0],
+                [min_xy[0], min_xy[1], 0.0],
+                [min_xy[0], max_xy[1], 0.0],
+            ]
+        ).T
+
+    if best_points is None:
+        raise ValueError(
+            f"No collision box found for contact frame '{contact_frame_name}' "
+            f"through link '{collision_link_name}'"
+        )
+
+    return best_points
+
+
+def _contact_patch_summary(contact_points: np.ndarray) -> str:
+    x_min, x_max = contact_points[0].min(), contact_points[0].max()
+    y_min, y_max = contact_points[1].min(), contact_points[1].max()
+    return (
+        f"x=[{x_min:.3f}, {x_max:.3f}], y=[{y_min:.3f}, {y_max:.3f}] "
+        f"(half extents {0.5 * (x_max - x_min):.3f}, {0.5 * (y_max - y_min):.3f})"
+    )
+
+
 class TSIDFixedComController:
     def __init__(
         self,
@@ -41,6 +166,8 @@ class TSIDFixedComController:
         q0: np.ndarray,
         left_foot_frame: str,
         right_foot_frame: str,
+        left_contact_points: np.ndarray,
+        right_contact_points: np.ndarray,
     ):
         self.robot = tsid.RobotWrapper(
             str(urdf_path), [str(package_root)], pin.JointModelFreeFlyer(), False
@@ -50,6 +177,8 @@ class TSIDFixedComController:
 
         self.left_foot_frame = left_foot_frame
         self.right_foot_frame = right_foot_frame
+        self.left_contact_points = left_contact_points
+        self.right_contact_points = right_contact_points
         self.left_foot_id = self._get_frame_id(left_foot_frame)
         self.right_foot_id = self._get_frame_id(right_foot_frame)
 
@@ -75,17 +204,6 @@ class TSIDFixedComController:
         f_max = 2000.0
         contact_normal = np.array([0.0, 0.0, 1.0])
 
-        lx = 0.10
-        ly = 0.05
-        contact_points = np.array(
-            [
-                [lx, ly, 0.0],
-                [lx, -ly, 0.0],
-                [-lx, -ly, 0.0],
-                [-lx, ly, 0.0],
-            ]
-        ).T
-
         kp_contact = 50.0
         kd_contact = 2.0 * math.sqrt(kp_contact)
         w_force_reg = 1e-5
@@ -94,7 +212,7 @@ class TSIDFixedComController:
             "contact-left",
             self.robot,
             self.left_foot_frame,
-            contact_points,
+            self.left_contact_points,
             contact_normal,
             mu,
             f_min,
@@ -111,7 +229,7 @@ class TSIDFixedComController:
             "contact-right",
             self.robot,
             self.right_foot_frame,
-            contact_points,
+            self.right_contact_points,
             contact_normal,
             mu,
             f_min,
@@ -168,7 +286,6 @@ class TSIDFixedComController:
             raise RuntimeError(f"TSID QP solver failed at t={t:.3f} with status {sol.status}")
 
         return self.invdyn.getActuatorForces(sol)
-Memmo 2020 summer school
 
 
 def parse_args():
@@ -224,12 +341,19 @@ def main():
     simulator.reset_robot_configuration(q_init)
     simulator.disable_joint_motors()
 
+    left_contact_points = contact_points_from_urdf_box(urdf_path, "left_sole_link")
+    right_contact_points = contact_points_from_urdf_box(urdf_path, "right_sole_link")
+    print(f"Left TSID contact patch from URDF: {_contact_patch_summary(left_contact_points)}")
+    print(f"Right TSID contact patch from URDF: {_contact_patch_summary(right_contact_points)}")
+
     controller = TSIDFixedComController(
         urdf_path=urdf_path,
         package_root=package_root,
         q0=q_init,
         left_foot_frame="left_sole_link",
         right_foot_frame="right_sole_link",
+        left_contact_points=left_contact_points,
+        right_contact_points=right_contact_points,
     )
 
     com0 = pin.centerOfMass(talos.model, talos.data, q_init)

@@ -1,10 +1,10 @@
 """
-TSID torque-control example: fixed-feet COM transfer in PyBullet.
+TSID torque-control example: fixed-feet COM tracking in PyBullet.
 
 This is the first inverse-dynamics replacement for the IK loop in
 example_4_physics_simulation.py. Both feet stay rigidly constrained on the
-ground, and the COM reference moves laterally so the load shifts from one foot
-to the other. No foot swing or contact switching is performed yet.
+ground, and the COM reference is fixed for easier torque-control debugging.
+No foot swing, COM transfer, or contact switching is performed yet.
 """
 
 import argparse
@@ -30,13 +30,10 @@ from biped_walking_controller.simulation import (
 class GeneralParams:
     dt: float = 1.0 / 500.0
     duration: float = 8.0
-    period: float = 4.0
-    settle_duration: float = 1.0
-    com_shift_ratio: float = 0.75
     n_solver_iter: int = 1000
 
 
-class TSIDComShiftController:
+class TSIDFixedComController:
     def __init__(
         self,
         urdf_path: Path,
@@ -56,7 +53,7 @@ class TSIDComShiftController:
         self.left_foot_id = self._get_frame_id(left_foot_frame)
         self.right_foot_id = self._get_frame_id(right_foot_frame)
 
-        self.invdyn = tsid.InverseDynamicsFormulationAccForce("tsid-com-shift", self.robot, False)
+        self.invdyn = tsid.InverseDynamicsFormulationAccForce("tsid-fixed-com", self.robot, False)
         self.invdyn.computeProblemData(0.0, q0, self.v0)
 
         self._add_foot_contacts()
@@ -156,13 +153,11 @@ class TSIDComShiftController:
         q: np.ndarray,
         v: np.ndarray,
         com_ref: np.ndarray,
-        com_vel_ref: np.ndarray,
-        com_acc_ref: np.ndarray,
     ) -> np.ndarray:
         com_sample = tsid.TrajectorySample(3)
         com_sample.pos(com_ref)
-        com_sample.vel(com_vel_ref)
-        com_sample.acc(com_acc_ref)
+        com_sample.vel(np.zeros(3))
+        com_sample.acc(np.zeros(3))
 
         self.com_task.setReference(com_sample)
         self.posture_task.setReference(self.posture_sample)
@@ -173,6 +168,7 @@ class TSIDComShiftController:
             raise RuntimeError(f"TSID QP solver failed at t={t:.3f} with status {sol.status}")
 
         return self.invdyn.getActuatorForces(sol)
+Memmo 2020 summer school
 
 
 def parse_args():
@@ -187,44 +183,12 @@ def parse_args():
     parser.add_argument("--launch-gui", action="store_true")
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--duration", type=float, default=GeneralParams.duration)
-    parser.add_argument("--period", type=float, default=GeneralParams.period)
-    parser.add_argument("--com-shift-ratio", type=float, default=GeneralParams.com_shift_ratio)
     return parser.parse_args()
-
-
-def make_com_reference(
-    t: float,
-    params: GeneralParams,
-    com_center: np.ndarray,
-    left_foot_pos: np.ndarray,
-    right_foot_pos: np.ndarray,
-):
-    com_ref = com_center.copy()
-    com_vel_ref = np.zeros(3)
-    com_acc_ref = np.zeros(3)
-
-    if t < params.settle_duration:
-        return com_ref, com_vel_ref, com_acc_ref
-
-    half_step = 0.5 * abs(left_foot_pos[1] - right_foot_pos[1])
-    amplitude = params.com_shift_ratio * half_step
-    omega = 2.0 * math.pi / params.period
-    phase = omega * (t - params.settle_duration)
-
-    com_ref[1] = com_center[1] + amplitude * math.sin(phase)
-    com_vel_ref[1] = amplitude * omega * math.cos(phase)
-    com_acc_ref[1] = -amplitude * omega * omega * math.sin(phase)
-
-    return com_ref, com_vel_ref, com_acc_ref
 
 
 def main():
     args = parse_args()
-    params = GeneralParams(
-        duration=args.duration,
-        period=args.period,
-        com_shift_ratio=args.com_shift_ratio,
-    )
+    params = GeneralParams(duration=args.duration)
 
     np.set_printoptions(suppress=True, precision=3)
 
@@ -260,7 +224,7 @@ def main():
     simulator.reset_robot_configuration(q_init)
     simulator.disable_joint_motors()
 
-    controller = TSIDComShiftController(
+    controller = TSIDFixedComController(
         urdf_path=urdf_path,
         package_root=package_root,
         q0=q_init,
@@ -270,7 +234,8 @@ def main():
 
     com0 = pin.centerOfMass(talos.model, talos.data, q_init)
     feet_mid = 0.5 * (oMf_lf_tgt.translation + oMf_rf_tgt.translation)
-    com_center = np.array([feet_mid[0], feet_mid[1], com0[2]])
+    com_ref = np.array([feet_mid[0], feet_mid[1], com0[2]])
+    print(f"Fixed COM reference: [{com_ref[0]:.3f}, {com_ref[1]:.3f}, {com_ref[2]:.3f}]")
 
     pb.setGravity(0, 0, 0)
     for _ in range(10):
@@ -294,16 +259,8 @@ def main():
         q = simulator.get_q(talos.model.nq)
         v = simulator.get_v(talos.model.nv)
 
-        com_ref, com_vel_ref, com_acc_ref = make_com_reference(
-            t,
-            params,
-            com_center,
-            oMf_lf_tgt.translation,
-            oMf_rf_tgt.translation,
-        )
-
         try:
-            tau = controller.compute(t, q, v, com_ref, com_vel_ref, com_acc_ref)
+            tau = controller.compute(t, q, v, com_ref)
         except RuntimeError as exc:
             print(exc)
             break

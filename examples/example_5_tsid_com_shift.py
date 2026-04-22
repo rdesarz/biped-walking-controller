@@ -149,7 +149,7 @@ def _contact_patch_summary(contact_points: np.ndarray) -> str:
     )
 
 
-class TSIDFixedComController:
+class TSIDController:
     def __init__(
         self,
         urdf_path: Path,
@@ -173,7 +173,7 @@ class TSIDFixedComController:
         self.left_foot_id = self._get_frame_id(left_foot_frame)
         self.right_foot_id = self._get_frame_id(right_foot_frame)
 
-        self.invdyn = tsid.InverseDynamicsFormulationAccForce("tsid-fixed-com", self.robot, False)
+        self.invdyn = tsid.InverseDynamicsFormulationAccForce("tsid", self.robot, False)
         self.invdyn.computeProblemData(0.0, q0, self.v0)
 
         self._add_foot_contacts()
@@ -192,11 +192,13 @@ class TSIDFixedComController:
     def _add_foot_contacts(self):
         mu = 0.5
         f_min = 1.0
-        f_max = 2000.0
+        f_max = 1000.0
         contact_normal = np.array([0.0, 0.0, 1.0])
 
-        kp_contact = 50.0
+        kp_contact = 30.0
         kd_contact = 2.0 * math.sqrt(kp_contact)
+
+        # Weight for contact force regularization in the cost
         w_force_reg = 1e-5
 
         self.contact_left = tsid.Contact6d(
@@ -241,22 +243,30 @@ class TSIDFixedComController:
         self.com_task = tsid.TaskComEquality("task-com", self.robot)
         self.com_task.setKp(kp_com * np.ones(3))
         self.com_task.setKd(kd_com * np.ones(3))
-        self.invdyn.addMotionTask(self.com_task, w_com, 1, 0.0)
+        self.invdyn.addMotionTask(self.com_task, w_com, 0, 0.0)
 
     def _add_waist_task(self):
         kp_waist = 500.0
-        kd_waist = 2.0 * math.sqrt(kp_com)
+        kd_waist = 2.0 * math.sqrt(kp_waist)
         w_waist = 1.0
 
         self.waist_task = tsid.TaskSE3Equality("task-waist", self.robot, "root_joint")
         self.waist_task.setKp(kp_waist * np.ones(6))
         self.waist_task.setKd(kd_waist * np.ones(3))
+
+        # Add a Mask to the task which will select the vector dimensions on which the task will act.
+        # In this case the waist configuration is a vector 6d (position and orientation -> SE3)
+        # Here we set a mask = [0 0 0 1 1 1] so the task on the waist will act on the orientation of the robot
+        mask = np.ones(6)
+        mask[:3] = 0.0
+        self.waist_task.setMask(mask)
+        # Add the task to the HQP with weight = 1.0, priority level = 1 (in the cost function) and a transition duration = 0.0
         self.invdyn.addMotionTask(self.waist_task, w_waist, 1, 0.0)
 
     def _add_posture_task(self, q0: np.ndarray):
-        kp_posture = 2.0
+        kp_posture = 1.0
         kd_posture = 2.0 * math.sqrt(kp_posture)
-        w_posture = 0.05
+        w_posture = 0.1
 
         self.posture_task = tsid.TaskJointPosture("task-posture", self.robot)
         self.posture_task.setKp(kp_posture * np.ones(self.robot.nv - 6))
@@ -347,7 +357,7 @@ def main():
     print(f"Left TSID contact patch from URDF: {_contact_patch_summary(left_contact_points)}")
     print(f"Right TSID contact patch from URDF: {_contact_patch_summary(right_contact_points)}")
 
-    controller = TSIDFixedComController(
+    controller = TSIDController(
         urdf_path=urdf_path,
         package_root=package_root,
         q0=q_init,

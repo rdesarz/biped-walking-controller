@@ -166,8 +166,8 @@ class TSIDController:
         self.model = self.robot.model()
         self.v0 = np.zeros(self.robot.nv)
 
-        self.left_foot_frame = left_foot_frame
-        self.right_foot_frame = right_foot_frame
+        self.left_foot_frame = "leg_left_6_joint"
+        self.right_foot_frame = "leg_right_6_joint"
         self.left_contact_points = left_contact_points
         self.right_contact_points = right_contact_points
         self.left_foot_id = self._get_frame_id(left_foot_frame)
@@ -194,10 +194,20 @@ class TSIDController:
         return frame_id
 
     def _add_foot_contacts(self):
-        mu = 0.5
+        mu = 0.3
         f_min = 1.0
         f_max = 1000.0
         contact_normal = np.array([0.0, 0.0, 1.0])
+
+        lxp = 0.1  # foot length in positive x direction
+        lxn = 0.11  # foot length in negative x direction
+        lyp = 0.069  # foot length in positive y direction
+        lyn = 0.069  # foot length in negative y direction
+        lz = 0.107  # foot sole height with respect to ankle joint
+
+        contact_point = np.ones((3, 4)) * lz
+        contact_point[0, :] = [-lxn, -lxn, lxp, lxp]
+        contact_point[1, :] = [-lyn, lyp, -lyn, lyp]
 
         kp_contact = 30.0
         kd_contact = 2.0 * math.sqrt(kp_contact)
@@ -205,11 +215,12 @@ class TSIDController:
         # Weight for contact force regularization in the cost
         w_force_reg = 1e-5
 
+        # Left foot
         self.contact_left = tsid.Contact6d(
             "contact-left",
             self.robot,
             self.left_foot_frame,
-            self.left_contact_points,
+            contact_point,
             contact_normal,
             mu,
             f_min,
@@ -218,15 +229,15 @@ class TSIDController:
         self.contact_left.setKp(kp_contact * np.ones(6))
         self.contact_left.setKd(kd_contact * np.ones(6))
         self.contact_left.setReference(
-            self.robot.framePosition(self.invdyn.data(), self.left_foot_id)
+            self.robot.position(self.data, self.model.getJointId(self.left_foot_frame))
         )
-        self.invdyn.addRigidContact(self.contact_left, w_force_reg, 1.0, 1)
+        self.invdyn.addRigidContact(self.contact_left, w_force_reg, 1.0, 0)
 
         self.contact_right = tsid.Contact6d(
             "contact-right",
             self.robot,
             self.right_foot_frame,
-            self.right_contact_points,
+            contact_point,
             contact_normal,
             mu,
             f_min,
@@ -235,9 +246,9 @@ class TSIDController:
         self.contact_right.setKp(kp_contact * np.ones(6))
         self.contact_right.setKd(kd_contact * np.ones(6))
         self.contact_right.setReference(
-            self.robot.framePosition(self.invdyn.data(), self.right_foot_id)
+            self.robot.position(self.data, self.model.getJointId(self.right_foot_frame))
         )
-        self.invdyn.addRigidContact(self.contact_right, w_force_reg, 1.0, 1)
+        self.invdyn.addRigidContact(self.contact_right, w_force_reg, 1.0, 0)
 
     def _add_com_task(self):
         kp_com = 20.0

@@ -25,130 +25,6 @@ class GeneralParams:
     n_solver_iter: int = 1000
 
 
-def _parse_xyz(text: str | None) -> np.ndarray:
-    if text is None:
-        return np.zeros(3)
-    return np.array([float(v) for v in text.split()], dtype=float)
-
-
-def _rpy_to_matrix(rpy: np.ndarray) -> np.ndarray:
-    roll, pitch, yaw = rpy
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-
-    rot_x = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
-    rot_y = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
-    rot_z = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
-
-    return rot_z @ rot_y @ rot_x
-
-
-def _origin_to_transform(origin: ET.Element | None) -> np.ndarray:
-    transform = np.eye(4)
-    if origin is None:
-        return transform
-
-    xyz = _parse_xyz(origin.attrib.get("xyz"))
-    rpy = _parse_xyz(origin.attrib.get("rpy"))
-    transform[:3, :3] = _rpy_to_matrix(rpy)
-    transform[:3, 3] = xyz
-    return transform
-
-
-def _find_link(root: ET.Element, link_name: str) -> ET.Element:
-    for link in root.findall("link"):
-        if link.attrib.get("name") == link_name:
-            return link
-    raise ValueError(f"Link '{link_name}' not found in URDF")
-
-
-def _find_parent_link_and_transform(root: ET.Element, child_link_name: str):
-    for joint in root.findall("joint"):
-        child = joint.find("child")
-        if child is None or child.attrib.get("link") != child_link_name:
-            continue
-
-        parent = joint.find("parent")
-        if parent is None:
-            break
-
-        return parent.attrib["link"], _origin_to_transform(joint.find("origin"))
-
-    return child_link_name, np.eye(4)
-
-
-def contact_points_from_urdf_box(urdf_path: Path, contact_frame_name: str) -> np.ndarray:
-    """
-    Read the rectangular foot contact patch from a URDF collision box.
-
-    Talos stores the foot collision box on ``leg_*_6_link`` and attaches the
-    ``*_sole_link`` contact frame with a fixed joint. This function transforms
-    that box into the sole frame and returns its XY footprint at z=0.
-    """
-    root = ET.parse(urdf_path).getroot()
-    collision_link_name, parent_to_contact = _find_parent_link_and_transform(
-        root, contact_frame_name
-    )
-    collision_link = _find_link(root, collision_link_name)
-    contact_to_parent = np.linalg.inv(parent_to_contact)
-
-    best_points = None
-    best_area = -np.inf
-
-    for collision in collision_link.findall("collision"):
-        box = collision.find("geometry/box")
-        if box is None:
-            continue
-
-        size = _parse_xyz(box.attrib["size"])
-        half_size = 0.5 * size
-        parent_to_box = _origin_to_transform(collision.find("origin"))
-
-        local_corners = np.array(
-            [
-                [sx * half_size[0], sy * half_size[1], sz * half_size[2], 1.0]
-                for sx in (-1.0, 1.0)
-                for sy in (-1.0, 1.0)
-                for sz in (-1.0, 1.0)
-            ]
-        ).T
-        contact_corners = (contact_to_parent @ parent_to_box @ local_corners)[:3].T
-
-        min_xy = contact_corners[:, :2].min(axis=0)
-        max_xy = contact_corners[:, :2].max(axis=0)
-        area = np.prod(max_xy - min_xy)
-        if area <= best_area:
-            continue
-
-        best_area = area
-        best_points = np.array(
-            [
-                [max_xy[0], max_xy[1], 0.0],
-                [max_xy[0], min_xy[1], 0.0],
-                [min_xy[0], min_xy[1], 0.0],
-                [min_xy[0], max_xy[1], 0.0],
-            ]
-        ).T
-
-    if best_points is None:
-        raise ValueError(
-            f"No collision box found for contact frame '{contact_frame_name}' "
-            f"through link '{collision_link_name}'"
-        )
-
-    return best_points
-
-
-def _contact_patch_summary(contact_points: np.ndarray) -> str:
-    x_min, x_max = contact_points[0].min(), contact_points[0].max()
-    y_min, y_max = contact_points[1].min(), contact_points[1].max()
-    return (
-        f"x=[{x_min:.3f}, {x_max:.3f}], y=[{y_min:.3f}, {y_max:.3f}] "
-        f"(half extents {0.5 * (x_max - x_min):.3f}, {0.5 * (y_max - y_min):.3f})"
-    )
-
-
 class TSIDController:
     def __init__(
         self,
@@ -157,8 +33,6 @@ class TSIDController:
         q0: np.ndarray,
         left_foot_frame: str,
         right_foot_frame: str,
-        left_contact_points: np.ndarray,
-        right_contact_points: np.ndarray,
     ):
         self.robot = tsid.RobotWrapper(
             str(urdf_path), [str(package_root)], pin.JointModelFreeFlyer(), False
@@ -168,17 +42,16 @@ class TSIDController:
 
         self.left_foot_frame = "leg_left_6_joint"
         self.right_foot_frame = "leg_right_6_joint"
-        self.left_contact_points = left_contact_points
-        self.right_contact_points = right_contact_points
         self.left_foot_id = self._get_frame_id(left_foot_frame)
         self.right_foot_id = self._get_frame_id(right_foot_frame)
 
         self.invdyn = tsid.InverseDynamicsFormulationAccForce("tsid", self.robot, False)
         self.invdyn.computeProblemData(0.0, q0, self.v0)
+        self.data = self.invdyn.data()
 
         self._add_foot_contacts()
         self._add_com_task()
-        self._add_waist_task()
+        # self._add_waist_task()
         self._add_posture_task(q0)
 
         # Use EiquadprogFast: dynamic matrix sizes (memory allocation performed only when resizing)
@@ -231,7 +104,7 @@ class TSIDController:
         self.contact_left.setReference(
             self.robot.position(self.data, self.model.getJointId(self.left_foot_frame))
         )
-        self.invdyn.addRigidContact(self.contact_left, w_force_reg, 1.0, 0)
+        self.invdyn.addRigidContact(self.contact_left, w_force_reg, 1.0, 1)
 
         self.contact_right = tsid.Contact6d(
             "contact-right",
@@ -248,7 +121,7 @@ class TSIDController:
         self.contact_right.setReference(
             self.robot.position(self.data, self.model.getJointId(self.right_foot_frame))
         )
-        self.invdyn.addRigidContact(self.contact_right, w_force_reg, 1.0, 0)
+        self.invdyn.addRigidContact(self.contact_right, w_force_reg, 1.0, 1)
 
     def _add_com_task(self):
         kp_com = 20.0
@@ -258,7 +131,7 @@ class TSIDController:
         self.com_task = tsid.TaskComEquality("task-com", self.robot)
         self.com_task.setKp(kp_com * np.ones(3))
         self.com_task.setKd(kd_com * np.ones(3))
-        self.invdyn.addMotionTask(self.com_task, w_com, 0, 0.0)
+        self.invdyn.addMotionTask(self.com_task, w_com, 1, 0.0)
 
     def _add_waist_task(self):
         kp_waist = 500.0
@@ -267,7 +140,7 @@ class TSIDController:
 
         self.waist_task = tsid.TaskSE3Equality("task-waist", self.robot, "root_joint")
         self.waist_task.setKp(kp_waist * np.ones(6))
-        self.waist_task.setKd(kd_waist * np.ones(3))
+        self.waist_task.setKd(kd_waist * np.ones(6))
 
         # Add a Mask to the task which will select the vector dimensions on which the task will act.
         # In this case the waist configuration is a vector 6d (position and orientation -> SE3)
@@ -324,7 +197,7 @@ class TSIDController:
         self.invdyn.addMotionTask(self.posture_task, w_posture, 1, 0.0)
 
         self.posture_sample = tsid.TrajectorySample(self.robot.nv - 6)
-        self.posture_sample.pos(q0[7:])
+        self.posture_sample.value(q0[7:])
 
     def compute(
         self,
@@ -334,9 +207,9 @@ class TSIDController:
         com_ref: np.ndarray,
     ) -> np.ndarray:
         com_sample = tsid.TrajectorySample(3)
-        com_sample.pos(com_ref)
-        com_sample.vel(np.zeros(3))
-        com_sample.acc(np.zeros(3))
+        com_sample.value(com_ref)
+        com_sample.derivative(np.zeros(3))
+        com_sample.second_derivative(np.zeros(3))
 
         self.com_task.setReference(com_sample)
         self.posture_task.setReference(self.posture_sample)
@@ -371,7 +244,7 @@ def main():
     np.set_printoptions(suppress=True, precision=3)
 
     package_root = args.path_talos_data.expanduser().resolve()
-    urdf_path = package_root / "talos_data" / "urdf" / "talos_full.urdf"
+    urdf_path = package_root / "talos_data" / "urdf" / "talos_reduced.urdf"
     if not urdf_path.is_file():
         raise FileNotFoundError(f"URDF file not found: {urdf_path}")
 
@@ -382,7 +255,7 @@ def main():
         dt=params.dt,
         path_to_robot_urdf=urdf_path,
         model=talos,
-        launch_gui=args.launch_gui,
+        launch_gui=True,
         n_solver_iter=params.n_solver_iter,
     )
 
@@ -402,19 +275,12 @@ def main():
     simulator.reset_robot_configuration(q_init)
     simulator.disable_joint_motors()
 
-    left_contact_points = contact_points_from_urdf_box(urdf_path, "left_sole_link")
-    right_contact_points = contact_points_from_urdf_box(urdf_path, "right_sole_link")
-    print(f"Left TSID contact patch from URDF: {_contact_patch_summary(left_contact_points)}")
-    print(f"Right TSID contact patch from URDF: {_contact_patch_summary(right_contact_points)}")
-
     controller = TSIDController(
         urdf_path=urdf_path,
         package_root=package_root,
         q0=q_init,
         left_foot_frame="left_sole_link",
         right_foot_frame="right_sole_link",
-        left_contact_points=left_contact_points,
-        right_contact_points=right_contact_points,
     )
 
     com0 = pin.centerOfMass(talos.model, talos.data, q_init)

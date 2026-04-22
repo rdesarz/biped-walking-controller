@@ -264,13 +264,48 @@ class TSIDController:
         self.invdyn.addMotionTask(self.waist_task, w_waist, 1, 0.0)
 
     def _add_posture_task(self, q0: np.ndarray):
-        kp_posture = 1.0
-        kd_posture = 2.0 * math.sqrt(kp_posture)
+        kp_posture = np.array(  # proportional gain of joint posture task
+            [
+                10.0,
+                5.0,
+                5.0,
+                1.0,
+                1.0,
+                10.0,  # lleg, low gain on axis along y and knee
+                10.0,
+                5.0,
+                5.0,
+                1.0,
+                1.0,
+                10.0,  # rleg
+                500.0,
+                500.0,  # chest
+                50.0,
+                10.0,
+                10.0,
+                10.0,
+                10.0,
+                10.0,
+                10.0,
+                10.0,  # larm
+                50.0,
+                10.0,
+                10.0,
+                10.0,
+                10.0,
+                10.0,
+                10.0,
+                10.0,  # rarm
+                100.0,
+                100.0,
+            ]  # head
+        )
+
         w_posture = 0.1
 
         self.posture_task = tsid.TaskJointPosture("task-posture", self.robot)
-        self.posture_task.setKp(kp_posture * np.ones(self.robot.nv - 6))
-        self.posture_task.setKd(kd_posture * np.ones(self.robot.nv - 6))
+        self.posture_task.setKp(kp_posture)
+        self.posture_task.setKd(2.0 * kp_posture)
         self.invdyn.addMotionTask(self.posture_task, w_posture, 1, 0.0)
 
         self.posture_sample = tsid.TrajectorySample(self.robot.nv - 6)

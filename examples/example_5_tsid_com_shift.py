@@ -178,9 +178,13 @@ class TSIDController:
 
         self._add_foot_contacts()
         self._add_com_task()
+        self._add_waist_task()
         self._add_posture_task(q0)
 
+        # Use EiquadprogFast: dynamic matrix sizes (memory allocation performed only when resizing)
         self.solver = tsid.SolverHQuadProgFast("solver-qp")
+
+        # Resize the solver to fit the number of variables, equality and inequality constraints
         self.solver.resize(self.invdyn.nVar, self.invdyn.nEq, self.invdyn.nIn)
 
     def _get_frame_id(self, frame_name: str) -> int:

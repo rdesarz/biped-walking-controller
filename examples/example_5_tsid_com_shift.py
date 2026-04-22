@@ -1,12 +1,3 @@
-"""
-TSID torque-control example: fixed-feet COM tracking in PyBullet.
-
-This is the first inverse-dynamics replacement for the IK loop in
-example_4_physics_simulation.py. Both feet stay rigidly constrained on the
-ground, and the COM reference is fixed for easier torque-control debugging.
-No foot swing, COM transfer, or contact switching is performed yet.
-"""
-
 import argparse
 import math
 from dataclasses import dataclass
@@ -243,7 +234,7 @@ class TSIDFixedComController:
         self.invdyn.addRigidContact(self.contact_right, w_force_reg, 1.0, 1)
 
     def _add_com_task(self):
-        kp_com = 40.0
+        kp_com = 20.0
         kd_com = 2.0 * math.sqrt(kp_com)
         w_com = 1.0
 
@@ -251,6 +242,16 @@ class TSIDFixedComController:
         self.com_task.setKp(kp_com * np.ones(3))
         self.com_task.setKd(kd_com * np.ones(3))
         self.invdyn.addMotionTask(self.com_task, w_com, 1, 0.0)
+
+    def _add_waist_task(self):
+        kp_waist = 500.0
+        kd_waist = 2.0 * math.sqrt(kp_com)
+        w_waist = 1.0
+
+        self.waist_task = tsid.TaskSE3Equality("task-waist", self.robot, "root_joint")
+        self.waist_task.setKp(kp_waist * np.ones(6))
+        self.waist_task.setKd(kd_waist * np.ones(3))
+        self.invdyn.addMotionTask(self.waist_task, w_waist, 1, 0.0)
 
     def _add_posture_task(self, q0: np.ndarray):
         kp_posture = 2.0

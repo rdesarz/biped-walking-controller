@@ -20,7 +20,7 @@ from biped_walking_controller.simulation import (
 @dataclass
 class GeneralParams:
     dt: float = 1.0 / 500.0
-    duration: float = 8.0
+    duration: float = 100.0
     n_solver_iter: int = 1000
 
 
@@ -279,7 +279,10 @@ class TSIDController:
         self.com_task = tsid.TaskComEquality("task-com", self.robot)
         self.com_task.setKp(kp_com * np.ones(3))
         self.com_task.setKd(kd_com * np.ones(3))
-        self.invdyn.addMotionTask(self.com_task, w_com, 0, 0.0)
+        self.invdyn.addMotionTask(self.com_task, w_com, 1, 0.0)
+
+        com_ref = self.data.com[0]  # Initial value of the CoM
+        self.traj_com = tsid.TrajectoryEuclidianConstant("traj_com", com_ref)
 
     def _add_posture_task(self, q0: np.ndarray):
         kp_posture = posture_gains_from_model(self.model)
@@ -290,8 +293,7 @@ class TSIDController:
         self.posture_task.setKd(2.0 * np.sqrt(kp_posture))
         self.invdyn.addMotionTask(self.posture_task, w_posture, 1, 0.0)
 
-        self.posture_sample = tsid.TrajectorySample(self.robot.nv - 6)
-        self.posture_sample.value(q0[7:])
+        self.traj_posture = tsid.TrajectoryEuclidianConstant("traj_joint", q0[7:])
 
     def compute(
         self,
@@ -303,16 +305,30 @@ class TSIDController:
         self.com_sample.value(com_ref)
         self.com_sample.derivative(self.zero_com_derivatives)
         self.com_sample.second_derivative(self.zero_com_derivatives)
-
         self.com_task.setReference(self.com_sample)
-        self.posture_task.setReference(self.posture_sample)
+
+        posture_ref = self.traj_posture.computeNext()
+        self.posture_task.setReference(posture_ref)
 
         hqp = self.invdyn.computeProblemData(t, q, v)
         sol = self.solver.solve(hqp)
         if sol.status != 0:
             raise RuntimeError(f"TSID QP solver failed at t={t:.3f} with status {sol.status}")
+        
+        tau = self.invdyn.getActuatorForces(sol)
+        contact_forces = self.invdyn.getContactForces(sol)
 
-        return self.invdyn.getActuatorForces(sol)
+        print("solver status:", sol.status)
+        print("tau max:", np.max(np.abs(tau)))
+        print("com:", pin.centerOfMass(self.model, self.data, q))
+        print("com err:", pin.centerOfMass(self.model, self.data, q) - com_ref)
+
+        for name in ["contact-left", "contact-right"]:
+            if self.invdyn.checkContact(name, sol):
+                f = self.invdyn.getContactForce(name, sol)
+                print(name, "fz:", f[2], "force norm:", np.linalg.norm(f[:3]))
+
+        return tau
 
 
 def parse_args():
@@ -324,7 +340,7 @@ def parse_args():
         help="Path containing the talos_data folder.",
     )
     parser.add_argument("--plot-results", action="store_true")
-    parser.add_argument("--launch-gui", action="store_true")
+    parser.add_argument("--launch-gui", action="store_false")
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--duration", type=float, default=GeneralParams.duration)
     return parser.parse_args()
@@ -348,7 +364,7 @@ def main():
         dt=params.dt,
         path_to_robot_urdf=urdf_path,
         model=talos,
-        launch_gui=True,
+        launch_gui=args.launch_gui,
         n_solver_iter=params.n_solver_iter,
     )
 
@@ -385,7 +401,9 @@ def main():
 
     com0 = pin.centerOfMass(talos.model, talos.data, q_init)
     feet_mid = 0.5 * (oMf_lf_tgt.translation + oMf_rf_tgt.translation)
-    com_ref = np.array([feet_mid[0], feet_mid[1], com0[2]])
+    # com_ref = np.array([feet_mid[0], feet_mid[1], com0[2]])
+
+    com_ref = com0.copy()
     print(f"Fixed COM reference: [{com_ref[0]:.3f}, {com_ref[1]:.3f}, {com_ref[2]:.3f}]")
 
     pb.setGravity(0, 0, 0)
@@ -400,21 +418,21 @@ def main():
     com_pb_log = np.zeros((n_steps, 3))
     tau_max = np.zeros(n_steps)
 
-    if args.record_video:
-        simulator.start_video_record()
-
     for k, t in enumerate(time):
         q = simulator.get_q(talos.model.nq)
         v = simulator.get_v(talos.model.nv)
 
         try:
             tau = controller.compute(t, q, v, com_ref)
+
+            
         except RuntimeError as exc:
             print(exc)
             break
 
         simulator.apply_joint_torques(tau)
-        simulator.update_camera_to_follow_pos(com_ref[0], com_ref[1], 0.0)
+        # simulator.reset_robot_configuration(q_init)
+        # simulator.update_camera_to_follow_pos(com_ref[0], com_ref[1], 0.0)
         simulator.step()
 
         pin.forwardKinematics(talos.model, talos.data, q)
